@@ -249,25 +249,52 @@ class RedisSemanticCache(BaseCache):
             raise Exception("similarity_threshold must be provided, passed None")
         self.similarity_threshold = similarity_threshold
         self.embedding_model = embedding_model
+        # schema = {
+        #     "index": {
+        #         "name": "litellm_semantic_cache_index",
+        #         "prefix": "litellm",
+        #         "storage_type": "hash",
+        #     },
+        #     "fields": {
+        #         "text": [{"name": "response"}],
+        #         "text": [{"name": "prompt"}],
+        #         "vector": [
+        #             {
+        #                 "name": "litellm_embedding",
+        #                 "dims": 1536,
+        #                 "distance_metric": "cosine",
+        #                 "algorithm": "flat",
+        #                 "datatype": "float32",
+        #             }
+        #         ],
+        #     },
+        # }
         schema = {
             "index": {
                 "name": "litellm_semantic_cache_index",
                 "prefix": "litellm",
                 "storage_type": "hash",
             },
-            "fields": {
-                "text": [{"name": "response"}],
-                "text": [{"name": "prompt"}],
-                "vector": [
-                    {
-                        "name": "litellm_embedding",
+            "fields": [
+                {
+                    "name": "response",
+                    "type": "text"
+                },
+                {
+                    "name": "prompt",
+                    "type": "text"
+                },
+                {
+                    "name": "litellm_embedding",
+                    "type": "vector",
+                    "attrs": {
                         "dims": 1536,
                         "distance_metric": "cosine",
                         "algorithm": "flat",
-                        "datatype": "float32",
+                        "datatype": "float32"
                     }
-                ],
-            },
+                }
+            ]
         }
         if redis_url is None:
             # if no url passed, check if host, port and password are passed, if not raise an Exception
