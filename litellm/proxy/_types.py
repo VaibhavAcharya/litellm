@@ -224,12 +224,31 @@ class UpdateUserRequest(GenerateRequestBase):
     max_budget: Optional[float] = None
 
 
+class Member(LiteLLMBase):
+    role: Literal["admin", "user"]
+    user_id: str
+
+
 class NewTeamRequest(LiteLLMBase):
     team_alias: Optional[str] = None
     team_id: Optional[str] = None
     admins: list = []
     members: list = []
+    members_with_roles: List[Member] = []
     metadata: Optional[dict] = None
+
+
+class UpdateTeamRequest(LiteLLMBase):
+    team_id: str  # required
+    team_alias: Optional[str] = None
+    admins: Optional[list] = None
+    members: Optional[list] = None
+    members_with_roles: Optional[List[Member]] = None
+    metadata: Optional[dict] = None
+
+
+class DeleteTeamRequest(LiteLLMBase):
+    team_ids: List[str]  # required
 
 
 class LiteLLM_TeamTable(NewTeamRequest):
@@ -404,6 +423,10 @@ class LiteLLM_VerificationToken(LiteLLMBase):
     permissions: Dict = {}
     model_spend: Dict = {}
     model_max_budget: Dict = {}
+
+    # hidden params used for parallel request limiting, not required to create a token
+    user_id_rate_limits: Optional[dict] = None
+    team_id_rate_limits: Optional[dict] = None
 
     class Config:
         protected_namespaces = ()

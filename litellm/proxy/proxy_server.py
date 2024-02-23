@@ -1479,6 +1479,26 @@ class ProxyConfig:
 
                                 llm_guard_moderation_obj = _ENTERPRISE_LLMGuard()
                                 imported_list.append(llm_guard_moderation_obj)
+                            elif (
+                                isinstance(callback, str)
+                                and callback == "blocked_user_check"
+                            ):
+                                from litellm.proxy.enterprise.enterprise_hooks.blocked_user_list import (
+                                    _ENTERPRISE_BlockedUserList,
+                                )
+
+                                blocked_user_list = _ENTERPRISE_BlockedUserList()
+                                imported_list.append(blocked_user_list)
+                            elif (
+                                isinstance(callback, str)
+                                and callback == "banned_keywords"
+                            ):
+                                from litellm.proxy.enterprise.enterprise_hooks.banned_keywords import (
+                                    _ENTERPRISE_BannedKeywords,
+                                )
+
+                                banned_keywords_obj = _ENTERPRISE_BannedKeywords()
+                                imported_list.append(banned_keywords_obj)
                             else:
                                 imported_list.append(
                                     get_instance_fn(
@@ -4060,9 +4080,30 @@ async def user_info(
         else:
             user_info = None
         ## GET ALL TEAMS ##
-        teams = await prisma_client.get_data(
+        team_list = []
+        team_id_list = []
+        # _DEPRECATED_ check if user in 'member' field
+        teams_1 = await prisma_client.get_data(
             user_id=user_id, table_name="team", query_type="find_all"
         )
+
+        if teams_1 is not None and isinstance(teams_1, list):
+            team_list = teams_1
+            for team in teams_1:
+                team_id_list.append(team.team_id)
+
+        if user_info is not None:
+            # *NEW* get all teams in user 'teams' field
+            teams_2 = await prisma_client.get_data(
+                team_id_list=user_info.teams, table_name="team", query_type="find_all"
+            )
+
+            if teams_2 is not None and isinstance(teams_2, list):
+                for team in teams_2:
+                    if team.team_id not in team_id_list:
+                        team_list.append(team)
+                        team_id_list.append(team.team_id)
+
         ## GET ALL KEYS ##
         keys = await prisma_client.get_data(
             user_id=user_id,
@@ -4090,9 +4131,10 @@ async def user_info(
             "user_id": user_id,
             "user_info": user_info,
             "keys": keys,
-            "teams": teams,
+            "teams": team_list,
         }
     except Exception as e:
+        traceback.print_exc()
         if isinstance(e, HTTPException):
             raise ProxyException(
                 message=getattr(e, "detail", f"Authentication Error({str(e)})"),
@@ -4274,12 +4316,31 @@ async def new_team(
     Parameters:
     - team_alias: Optional[str] - User defined team alias
     - team_id: Optional[str] - The team id of the user. If none passed, we'll generate it.
-    - admins: list - A list of user IDs that will be owning the team
-    - members: list - A list of user IDs that will be members of the team
+    - members_with_roles: list - A list of dictionaries, mapping user_id to role in team (either 'admin' or 'user')
     - metadata: Optional[dict] - Metadata for team, store information for team. Example metadata = {"team": "core-infra", "app": "app2", "email": "ishaan@berri.ai" }
 
     Returns:
     - team_id: (str) Unique team id - used for tracking spend across multiple keys for same team id.
+
+    _deprecated_params: 
+    - admins: list - A list of user_id's for the admin role 
+    - users: list - A list of user_id's for the user role 
+
+    Example Request:
+    ```
+    curl --location 'http://0.0.0.0:8000/team/new' \
+    
+    --header 'Authorization: Bearer sk-1234' \
+    
+    --header 'Content-Type: application/json' \
+    
+    --data '{
+      "team_alias": "my-new-team_2",
+      "members_with_roles": [{"role": "admin", "user_id": "user-1234"}, 
+        {"role": "user", "user_id": "user-2434"}]
+    }'
+
+    ```
     """
     global prisma_client
 
@@ -4303,27 +4364,149 @@ async def new_team(
     team_row = await prisma_client.insert_data(
         data=complete_team_data.json(exclude_none=True), table_name="team"
     )
+
+    ## ADD TEAM ID TO USER TABLE ##
+    for user in complete_team_data.members_with_roles:
+        ## add team id to user row ##
+        await prisma_client.update_data(
+            user_id=user.user_id,
+            data={"user_id": user.user_id, "teams": [team_row.team_id]},
+            update_key_values={
+                "teams": {
+                    "push ": [team_row.team_id],
+                }
+            },
+        )
     return team_row
 
 
 @router.post(
     "/team/update", tags=["team management"], dependencies=[Depends(user_api_key_auth)]
 )
-async def update_team():
+async def update_team(
+    data: UpdateTeamRequest,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
     """
-    update team and members
+    You can now add / delete users from a team via /team/update
+
+    ```
+    curl --location 'http://0.0.0.0:8000/team/update' \
+    
+    --header 'Authorization: Bearer sk-1234' \
+        
+    --header 'Content-Type: application/json' \
+    
+    --data-raw '{
+        "team_id": "45e3e396-ee08-4a61-a88e-16b3ce7e0849",
+        "members_with_roles": [{"role": "admin", "user_id": "5c4a0aa3-a1e1-43dc-bd87-3c2da8382a3a"}, {"role": "user", "user_id": "krrish247652@berri.ai"}]
+    }'
+    ```
     """
-    pass
+    global prisma_client
+
+    if prisma_client is None:
+        raise HTTPException(status_code=500, detail={"error": "No db connected"})
+
+    if data.team_id is None:
+        raise HTTPException(status_code=400, detail={"error": "No team id passed in"})
+
+    existing_team_row = await prisma_client.get_data(
+        team_id=data.team_id, table_name="team", query_type="find_unique"
+    )
+
+    updated_kv = data.json(exclude_none=True)
+    team_row = await prisma_client.update_data(
+        update_key_values=updated_kv,
+        data=updated_kv,
+        table_name="team",
+        team_id=data.team_id,
+    )
+
+    ## ADD NEW USERS ##
+    existing_user_id_list = []
+    ## Get new users
+    for user in existing_team_row.members_with_roles:
+        existing_user_id_list.append(user["user_id"])
+
+    ## Update new user rows with team id (info used by /user/info to show all teams, user is a part of)
+    if data.members_with_roles is not None:
+        for user in data.members_with_roles:
+            if user.user_id not in existing_user_id_list:
+                await prisma_client.update_data(
+                    user_id=user.user_id,
+                    data={"user_id": user.user_id, "teams": [team_row["team_id"]]},
+                    update_key_values={
+                        "teams": {
+                            "push": [team_row["team_id"]],
+                        }
+                    },
+                )
+
+    ## REMOVE DELETED USERS ##
+    ### Get list of deleted users (old list - new list)
+    deleted_user_id_list = []
+    existing_user_id_list = []
+    ## Get old user list
+    for user in existing_team_row.members_with_roles:
+        existing_user_id_list.append(user["user_id"])
+    ## Get diff
+    if data.members_with_roles is not None:
+        for user in data.members_with_roles:
+            if user.user_id not in existing_user_id_list:
+                deleted_user_id_list.append(user.user_id)
+
+    ## SET UPDATED LIST
+    if len(deleted_user_id_list) > 0:
+        # get the deleted users
+        existing_user_rows = await prisma_client.get_data(
+            user_id_list=deleted_user_id_list, table_name="user", query_type="find_all"
+        )
+        for user in existing_user_rows:
+            if data.team_id in user["teams"]:
+                user["teams"].remove(data.team_id)
+            await prisma_client.update_data(
+                user_id=user["user_id"],
+                data=user,
+                update_key_values={"user_id": user["user_id"], "teams": user["teams"]},
+            )
+    return team_row
 
 
 @router.post(
     "/team/delete", tags=["team management"], dependencies=[Depends(user_api_key_auth)]
 )
-async def delete_team():
+async def delete_team(
+    data: DeleteTeamRequest,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
     """
-    delete team and team keys
+    delete team and associated team keys
+
+    ```
+    curl --location 'http://0.0.0.0:8000/team/delete' \
+        
+    --header 'Authorization: Bearer sk-1234' \
+        
+    --header 'Content-Type: application/json' \
+    
+    --data-raw '{
+        "team_ids": ["45e3e396-ee08-4a61-a88e-16b3ce7e0849"]
+    }'
+    ```
     """
-    pass
+    global prisma_client
+
+    if prisma_client is None:
+        raise HTTPException(status_code=500, detail={"error": "No db connected"})
+
+    if data.team_ids is None:
+        raise HTTPException(status_code=400, detail={"error": "No team id passed in"})
+
+    ## DELETE ASSOCIATED KEYS
+    await prisma_client.delete_data(team_id_list=data.team_ids, table_name="key")
+    ## DELETE TEAMS
+    await prisma_client.delete_data(team_id_list=data.team_ids, table_name="team")
 
 
 @router.get(
@@ -4959,7 +5142,15 @@ async def google_login(request: Request):
             scope=generic_scope,
         )
         with generic_sso:
-            return await generic_sso.get_login_redirect()
+            # TODO: state should be a random string and added to the user session with cookie
+            # or a cryptographicly signed state that we can verify stateless
+            # For simplification we are using a static state, this is not perfect but some
+            # SSO providers do not allow stateless verification
+            redirect_params = {}
+            state = os.getenv("GENERIC_CLIENT_STATE", None)
+            if state:
+                redirect_params["state"] = state
+            return await generic_sso.get_login_redirect(**redirect_params)  # type: ignore
     elif ui_username is not None:
         # No Google, Microsoft SSO
         # Use UI Credentials set in .env
@@ -5008,10 +5199,19 @@ async def login(request: Request):
             # checks if user is admin
             user_role = "app_admin"
             key_user_id = os.getenv("PROXY_ADMIN_ID", "default_user_id")
+
         # Admin is Authe'd in - generate key for the UI to access Proxy
+
+        # ensure this user is set as the proxy admin, in this route there is no sso, we can assume this user is only the admin
+        await user_update(
+            data=UpdateUserRequest(
+                user_id=key_user_id,
+                user_role="proxy_admin",
+            )
+        )
         if os.getenv("DATABASE_URL") is not None:
             response = await generate_key_helper_fn(
-                **{"duration": "1hr", "key_max_budget": 0, "models": [], "aliases": {}, "config": {}, "spend": 0, "user_id": key_user_id, "team_id": "litellm-dashboard"}  # type: ignore
+                **{"user_role": "proxy_admin", "duration": "1hr", "key_max_budget": 5, "models": [], "aliases": {}, "config": {}, "spend": 0, "user_id": key_user_id, "team_id": "litellm-dashboard"}  # type: ignore
             )
         else:
             response = {
@@ -5019,7 +5219,7 @@ async def login(request: Request):
                 "user_id": "litellm-dashboard",
             }
         key = response["token"]  # type: ignore
-        litellm_dashboard_ui = os.getenv("PROXY_BASE_URL", "/") + "ui/"
+        litellm_dashboard_ui = os.getenv("PROXY_BASE_URL", "") + "/ui/"
         import jwt
 
         jwt_token = jwt.encode(
@@ -5027,7 +5227,7 @@ async def login(request: Request):
                 "user_id": user_id,
                 "key": key,
                 "user_email": user_id,
-                "user_role": user_role,
+                "user_role": "app_admin",  # this is the path without sso - we can assume only admins will use this
             },
             "secret",
             algorithm="HS256",
@@ -5043,6 +5243,38 @@ async def login(request: Request):
             param="invalid_credentials",
             code=status.HTTP_401_UNAUTHORIZED,
         )
+
+
+@app.get("/get_image", include_in_schema=False)
+def get_image():
+    """Get logo to show on admin UI"""
+    from fastapi.responses import FileResponse
+
+    # get current_dir
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    default_logo = os.path.join(current_dir, "logo.jpg")
+
+    logo_path = os.getenv("UI_LOGO_PATH", default_logo)
+    verbose_proxy_logger.debug(f"Reading logo from {logo_path}")
+
+    # Check if the logo path is an HTTP/HTTPS URL
+    if logo_path.startswith(("http://", "https://")):
+        # Download the image and cache it
+        response = requests.get(logo_path)
+        if response.status_code == 200:
+            # Save the image to a local file
+            cache_path = os.path.join(current_dir, "cached_logo.jpg")
+            with open(cache_path, "wb") as f:
+                f.write(response.content)
+
+            # Return the cached image as a FileResponse
+            return FileResponse(cache_path, media_type="image/jpeg")
+        else:
+            # Handle the case when the image cannot be downloaded
+            return FileResponse(default_logo, media_type="image/jpeg")
+    else:
+        # Return the local image file if the logo path is not an HTTP/HTTPS URL
+        return FileResponse(logo_path, media_type="image/jpeg")
 
 
 @app.get("/sso/callback", tags=["experimental"])
@@ -5104,7 +5336,7 @@ async def auth_callback(request: Request):
         result = await microsoft_sso.verify_and_process(request)
     elif generic_client_id is not None:
         # make generic sso provider
-        from fastapi_sso.sso.generic import create_provider, DiscoveryDocument
+        from fastapi_sso.sso.generic import create_provider, DiscoveryDocument, OpenID
 
         generic_client_secret = os.getenv("GENERIC_CLIENT_SECRET", None)
         generic_scope = os.getenv("GENERIC_SCOPE", "openid email profile").split(" ")
@@ -5113,6 +5345,9 @@ async def auth_callback(request: Request):
         )
         generic_token_endpoint = os.getenv("GENERIC_TOKEN_ENDPOINT", None)
         generic_userinfo_endpoint = os.getenv("GENERIC_USERINFO_ENDPOINT", None)
+        generic_include_client_id = (
+            os.getenv("GENERIC_INCLUDE_CLIENT_ID", "false").lower() == "true"
+        )
         if generic_client_secret is None:
             raise ProxyException(
                 message="GENERIC_CLIENT_SECRET not set. Set it in .env file",
@@ -5147,12 +5382,50 @@ async def auth_callback(request: Request):
         verbose_proxy_logger.debug(
             f"GENERIC_REDIRECT_URI: {redirect_url}\nGENERIC_CLIENT_ID: {generic_client_id}\n"
         )
+
+        generic_user_id_attribute_name = os.getenv(
+            "GENERIC_USER_ID_ATTRIBUTE", "preferred_username"
+        )
+        generic_user_display_name_attribute_name = os.getenv(
+            "GENERIC_USER_DISPLAY_NAME_ATTRIBUTE", "sub"
+        )
+        generic_user_email_attribute_name = os.getenv(
+            "GENERIC_USER_EMAIL_ATTRIBUTE", "email"
+        )
+        generic_user_role_attribute_name = os.getenv(
+            "GENERIC_USER_ROLE_ATTRIBUTE", "role"
+        )
+        generic_user_first_name_attribute_name = os.getenv(
+            "GENERIC_USER_FIRST_NAME_ATTRIBUTE", "first_name"
+        )
+        generic_user_last_name_attribute_name = os.getenv(
+            "GENERIC_USER_LAST_NAME_ATTRIBUTE", "last_name"
+        )
+
+        verbose_proxy_logger.debug(
+            f" generic_user_id_attribute_name: {generic_user_id_attribute_name}\n generic_user_email_attribute_name: {generic_user_email_attribute_name}\n generic_user_role_attribute_name: {generic_user_role_attribute_name}"
+        )
+
         discovery = DiscoveryDocument(
             authorization_endpoint=generic_authorization_endpoint,
             token_endpoint=generic_token_endpoint,
             userinfo_endpoint=generic_userinfo_endpoint,
         )
-        SSOProvider = create_provider(name="oidc", discovery_document=discovery)
+
+        def response_convertor(response, client):
+            return OpenID(
+                id=response.get(generic_user_id_attribute_name),
+                display_name=response.get(generic_user_display_name_attribute_name),
+                email=response.get(generic_user_email_attribute_name),
+                first_name=response.get(generic_user_first_name_attribute_name),
+                last_name=response.get(generic_user_last_name_attribute_name),
+            )
+
+        SSOProvider = create_provider(
+            name="oidc",
+            discovery_document=discovery,
+            response_convertor=response_convertor,
+        )
         generic_sso = SSOProvider(
             client_id=generic_client_id,
             client_secret=generic_client_secret,
@@ -5161,43 +5434,36 @@ async def auth_callback(request: Request):
             scope=generic_scope,
         )
         verbose_proxy_logger.debug(f"calling generic_sso.verify_and_process")
-        request_body = await request.body()
-        request_query_params = request.query_params
-        # get "code" from query params
-        code = request_query_params.get("code")
-        result = await generic_sso.verify_and_process(request)
+        result = await generic_sso.verify_and_process(
+            request, params={"include_client_id": generic_include_client_id}
+        )
         verbose_proxy_logger.debug(f"generic result: {result}")
+
     # User is Authe'd in - generate key for the UI to access Proxy
     user_email = getattr(result, "email", None)
     user_id = getattr(result, "id", None)
 
     # generic client id
     if generic_client_id is not None:
-        generic_user_id_attribute_name = os.getenv("GENERIC_USER_ID_ATTRIBUTE", "email")
-        generic_user_email_attribute_name = os.getenv(
-            "GENERIC_USER_EMAIL_ATTRIBUTE", "email"
-        )
-        generic_user_role_attribute_name = os.getenv(
-            "GENERIC_USER_ROLE_ATTRIBUTE", "role"
-        )
-
-        verbose_proxy_logger.debug(
-            f" generic_user_id_attribute_name: {generic_user_id_attribute_name}\n generic_user_email_attribute_name: {generic_user_email_attribute_name}\n generic_user_role_attribute_name: {generic_user_role_attribute_name}"
-        )
-
-        user_id = getattr(result, generic_user_id_attribute_name, None)
-        user_email = getattr(result, generic_user_email_attribute_name, None)
+        user_id = getattr(result, "id", None)
+        user_email = getattr(result, "email", None)
         user_role = getattr(result, generic_user_role_attribute_name, None)
 
     if user_id is None:
         user_id = getattr(result, "first_name", "") + getattr(result, "last_name", "")
-    # get user_info from litellm DB
+
     user_info = None
-    if prisma_client is not None:
-        user_info = await prisma_client.get_data(user_id=user_id, table_name="user")
     user_id_models: List = []
-    if user_info is not None:
-        user_id_models = getattr(user_info, "models", [])
+
+    # User might not be already created on first generation of key
+    # But if it is, we want its models preferences
+    try:
+        if prisma_client is not None:
+            user_info = await prisma_client.get_data(user_id=user_id, table_name="user")
+            if user_info is not None:
+                user_id_models = getattr(user_info, "models", [])
+    except Exception as e:
+        pass
 
     response = await generate_key_helper_fn(
         **{
